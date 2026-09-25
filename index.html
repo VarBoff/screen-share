@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Screen Share</title>
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #181b22;
+      --text: #e6e8ee;
+      --muted: #8b90a0;
+      --accent: #4f8cff;
+      --danger: #ff5c5c;
+      --ok: #3ecf8e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px;
+      gap: 16px;
+    }
+    h1 { margin: 0; font-size: 1.4rem; }
+    .panel {
+      width: 100%;
+      max-width: 960px;
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    button {
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 0.95rem;
+      cursor: pointer;
+    }
+    button.secondary { background: #2a2f3a; }
+    button.danger { background: var(--danger); }
+    button:disabled { opacity: 0.5; cursor: default; }
+    input[type="text"] {
+      flex: 1;
+      min-width: 0;
+      background: #0f1115;
+      color: var(--text);
+      border: 1px solid #2a2f3a;
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 0.9rem;
+    }
+    #status { color: var(--muted); font-size: 0.9rem; }
+    #status.ok { color: var(--ok); }
+    #status.err { color: var(--danger); }
+    video {
+      width: 100%;
+      max-width: 960px;
+      background: black;
+      border-radius: 12px;
+      display: none;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <h1>Screen Share</h1>
+
+  <!-- Host view -->
+  <div id="hostPanel" class="panel hidden">
+    <div class="row">
+      <button id="startBtn">Share my screen</button>
+      <button id="stopBtn" class="danger hidden">Stop sharing</button>
+    </div>
+    <div id="linkRow" class="row hidden">
+      <input id="linkInput" type="text" readonly />
+      <button id="copyBtn" class="secondary">Copy link</button>
+    </div>
+    <div id="viewerCount" class="hidden"></div>
+  </div>
+
+  <!-- Viewer view -->
+  <div id="viewerPanel" class="panel hidden">
+    <div class="row">
+      <button id="unmuteBtn" class="secondary hidden">Unmute</button>
+      <button id="fullscreenBtn" class="secondary hidden">Fullscreen</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+  <video id="video" autoplay playsinline muted></video>
+
+  <script>
+    // Optional: add a TURN server here if viewers on strict networks can't connect.
+    // e.g. { urls: "turn:your.turn.server:3478", username: "user", credential: "pass" }
+    const ICE_SERVERS = [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+    ];
+    const PEER_OPTIONS = { config: { iceServers: ICE_SERVERS } };
+
+    const $ = (id) => document.getElementById(id);
+    const video = $("video");
+
+    function setStatus(text, kind = "") {
+      $("status").textContent = text;
+      $("status").className = kind;
+    }
+
+    const joinId = new URLSearchParams(location.search).get("join");
+    if (joinId) startViewer(joinId);
+    else startHost();
+
+    // ---------- Host ----------
+    function startHost() {
+      $("hostPanel").classList.remove("hidden");
+
+      let peer = null;
+      let screenStream = null;
+      const viewers = new Map(); // peerId -> { conn, call }
+
+      function updateViewerCount() {
+        const el = $("viewerCount");
+        el.classList.remove("hidden");
+        el.textContent = `Viewers: ${viewers.size}`;
+      }
+
+      function removeViewer(id) {
+        const v = viewers.get(id);
+        if (!v) return;
+        v.call?.close();
+        v.conn?.close();
+        viewers.delete(id);
+        updateViewerCount();
+      }
+
+      function stopSharing() {
+        screenStream?.getTracks().forEach((t) => t.stop());
+        screenStream = null;
+        for (const id of [...viewers.keys()]) removeViewer(id);
+        peer?.destroy();
+        peer = null;
+        video.srcObject = null;
+        video.style.display = "none";
+        $("startBtn").classList.remove("hidden");
+        $("stopBtn").classList.add("hidden");
+        $("linkRow").classList.add("hidden");
+        $("viewerCount").classList.add("hidden");
+        setStatus("Stopped sharing.");
+      }
+
+      $("startBtn").onclick = async () => {
+        try {
+          screenStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: 30 },
+            audio: true,
+          });
+        } catch (err) {
+          setStatus("Screen capture was cancelled or blocked.", "err");
+          return;
+        }
+
+        // Local preview
+        video.srcObject = screenStream;
+        video.style.display = "block";
+
+        // Stop everything if the user ends sharing from the browser's own UI
+        screenStream.getVideoTracks()[0].addEventListener("ended", stopSharing);
+
+        $("startBtn").classList.add("hidden");
+        $("stopBtn").classList.remove("hidden");
+        setStatus("Connecting to signaling server...");
+
+        peer = new Peer(PEER_OPTIONS);
+
+        peer.on("open", (id) => {
+          const link = `${location.origin}${location.pathname}?join=${id}`;
+          $("linkInput").value = link;
+          $("linkRow").classList.remove("hidden");
+          updateViewerCount();
+          setStatus("Sharing. Send the link to whoever should watch.", "ok");
+        });
+
+        // A viewer opens a data connection; we respond by calling them with the screen.
+        peer.on("connection", (conn) => {
+          conn.on("open", () => {
+            const call = peer.call(conn.peer, screenStream);
+            viewers.set(conn.peer, { conn, call });
+            updateViewerCount();
+            call.on("close", () => removeViewer(conn.peer));
+            call.on("error", () => removeViewer(conn.peer));
+          });
+          conn.on("close", () => removeViewer(conn.peer));
+        });
+
+        peer.on("disconnected", () => {
+          // Lost the signaling server; existing viewers keep working, try to reconnect for new ones.
+          if (peer && !peer.destroyed) peer.reconnect();
+        });
+
+        peer.on("error", (err) => {
+          setStatus(`Error: ${err.type || err.message}`, "err");
+        });
+      };
+
+      $("stopBtn").onclick = stopSharing;
+
+      $("copyBtn").onclick = async () => {
+        try {
+          await navigator.clipboard.writeText($("linkInput").value);
+          $("copyBtn").textContent = "Copied!";
+        } catch {
+          $("linkInput").select();
+          $("copyBtn").textContent = "Press Ctrl+C";
+        }
+        setTimeout(() => ($("copyBtn").textContent = "Copy link"), 1500);
+      };
+    }
+
+    // ---------- Viewer ----------
+    function startViewer(hostId) {
+      $("viewerPanel").classList.remove("hidden");
+      setStatus("Connecting...");
+
+      const peer = new Peer(PEER_OPTIONS);
+
+      peer.on("open", () => {
+        const conn = peer.connect(hostId, { reliable: true });
+        conn.on("close", () => {
+          setStatus("The host stopped sharing.", "err");
+          video.style.display = "none";
+        });
+      });
+
+      peer.on("call", (call) => {
+        call.answer(); // receive only
+        call.on("stream", (stream) => {
+          video.srcObject = stream;
+          video.style.display = "block";
+          $("fullscreenBtn").classList.remove("hidden");
+          if (stream.getAudioTracks().length) $("unmuteBtn").classList.remove("hidden");
+          setStatus("Connected.", "ok");
+        });
+        call.on("close", () => {
+          setStatus("The host stopped sharing.", "err");
+          video.style.display = "none";
+        });
+      });
+
+      peer.on("error", (err) => {
+        if (err.type === "peer-unavailable") {
+          setStatus("That share link isn't active. Ask the host for a new one.", "err");
+        } else {
+          setStatus(`Error: ${err.type || err.message}`, "err");
+        }
+      });
+
+      $("unmuteBtn").onclick = () => {
+        video.muted = !video.muted;
+        $("unmuteBtn").textContent = video.muted ? "Unmute" : "Mute";
+      };
+
+      $("fullscreenBtn").onclick = () => video.requestFullscreen?.();
+    }
+  </script>
+</body>
+</html>
