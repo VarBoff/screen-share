@@ -214,7 +214,8 @@
 
   <!-- Host controls -->
   <section id="hostPanel" class="panel hidden">
-    <div id="setupFields" style="display: contents">
+    <!-- Quality settings stay visible while live so they can be changed mid-share -->
+    <div style="display: contents">
       <label class="field">Quality
         <select id="qualitySel">
           <option value="720">720p</option>
@@ -236,6 +237,9 @@
           <option value="motion">Motion &amp; video</option>
         </select>
       </label>
+    </div>
+
+    <div id="setupFields" style="display: contents">
       <button id="startBtn" class="primary" style="margin-left: auto">Share my screen</button>
     </div>
 
@@ -451,15 +455,33 @@
         $("previewBtn").querySelector(".label").textContent = previewHidden ? "Show preview" : "Hide preview";
       };
 
-      $("startBtn").onclick = async () => {
+      function videoConstraints() {
         const q = parseInt($("qualitySel").value, 10);
         const fps = parseInt($("fpsSel").value, 10);
-        const videoConstraints = { frameRate: { ideal: fps, max: fps } };
-        if (q) videoConstraints.height = { ideal: q, max: q };
+        const c = { frameRate: { ideal: fps, max: fps } };
+        if (q) c.height = { ideal: q, max: q };
+        return c;
+      }
 
+      // Changing settings while live re-constrains the existing track, so the
+      // same capture, peer and share link keep working for everyone watching.
+      async function applyLiveSettings() {
+        const track = screenStream?.getVideoTracks()[0];
+        if (!track) return;
+        track.contentHint = $("hintSel").value;
+        try {
+          await track.applyConstraints(videoConstraints());
+          setStatus("Live", "live");
+        } catch (err) {
+          setStatus(`Couldn't apply settings: ${err.name || err.message}`, "warn");
+        }
+      }
+      for (const id of ["qualitySel", "fpsSel", "hintSel"]) $(id).onchange = applyLiveSettings;
+
+      $("startBtn").onclick = async () => {
         try {
           screenStream = await navigator.mediaDevices.getDisplayMedia({
-            video: videoConstraints,
+            video: videoConstraints(),
             audio: true,
           });
         } catch {
